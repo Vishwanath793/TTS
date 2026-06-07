@@ -1,30 +1,11 @@
 """
-PDF-to-Audio Pipeline v3 — Multi-Voice Cinematic Edition
+Text & PDF-to-Audio Pipeline v3.1 — Multi-Voice Cinematic Edition
 ==========================================================
-Pipeline: pdfplumber (extract + font analysis) → Role detection → Gemini (polish)
-          → edge-tts (multi-voice) → MP3 stitching
+Pipeline: pdfplumber (extract + font analysis) / txt → Role detection 
+          → Gemini (polish) → edge-tts (multi-voice) → MP3 stitching
 
-NEW IN v3:
-  • Font-aware extraction — reads each character's font name & size from the PDF
-    to detect bold, italic, headings, and body text at the source level.
-  • Role-based voice casting — headers, body, emphasis (bold), asides (italic),
-    quotes, author attributions, and list items each get a distinct voice/tone.
-  • Automatic pattern detection — "-- Author Name", blockquotes, parenthetical
-    asides, numbered lists, and em-dash interjections are all tagged.
-  • Segment-level audio generation — each segment is spoken in its assigned
-    voice, then stitched into a seamless MP3 with natural pauses between roles.
-  • Configurable voice profiles — swap voices via a simple JSON config or CLI.
-
-Requirements:
-    pip install pdfplumber edge-tts google-genai
-
-Usage:
-    export GEMINI_API_KEY="AIza..."
-    python pdf_to_audio_v3.py "file.pdf" --single-file
-    python pdf_to_audio_v3.py "file.pdf" --skip-ai --profile cinematic
-    python pdf_to_audio_v3.py "file.pdf" --profile audiobook --srt
-    python pdf_to_audio_v3.py --list-voices
-    python pdf_to_audio_v3.py --list-profiles
+NEW IN v3.1:
+  • Added native support for plain .txt files alongside PDFs.
 """
 
 import os
@@ -53,6 +34,7 @@ except ImportError:
     genai = None
 
 import edge_tts
+from functools import lru_cache
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -168,7 +150,7 @@ RETRY_BASE_DELAY   = 2
 # GEMINI PROMPT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-TTS_OPTIMIZER_PROMPT = """You are an Audio Script Editor optimizing PDF-extracted text for Text-to-Speech.
+TTS_OPTIMIZER_PROMPT = """You are an Audio Script Editor optimizing extracted text for Text-to-Speech.
 
 RULES:
 1. PRESERVE original meaning and wording. Do NOT summarize or add commentary.
@@ -187,7 +169,7 @@ OUTPUT: Only the final script with markers preserved. No markdown, no code fence
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 1: FONT-AWARE EXTRACTION
+# STEP 1: FONT-AWARE EXTRACTION (PDF ONLY)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
@@ -284,11 +266,13 @@ def extract_font_runs(pdf_path: str) -> list[FontRun]:
     return all_runs
 
 
+@lru_cache(maxsize=256)
 def _is_bold(fontname: str) -> bool:
     fn = fontname.lower()
     return any(k in fn for k in ("bold", "heavy", "black", "demi", "semibold"))
 
 
+@lru_cache(maxsize=256)
 def _is_italic(fontname: str) -> bool:
     fn = fontname.lower()
     return any(k in fn for k in ("italic", "oblique", "slant"))
@@ -307,6 +291,7 @@ _FOOTER_PAGE_RE = re.compile(
     r'(page\s+\d+|\bpg\.?\s*\d+|\d+\s*$|·\s*page\s*\d+|\|\s*page\s*\d+)',
     re.IGNORECASE,
 )
+_RE_DIGITS = re.compile(r'\d+')
 
 def _remove_margin_runs(runs: list[FontRun], total_pages: int) -> list[FontRun]:
     """
@@ -328,16 +313,13 @@ def _remove_margin_runs(runs: list[FontRun], total_pages: int) -> list[FontRun]:
         in_bot = r.top > r.page_height * (1 - MARGIN_FRAC)
         if not (in_top or in_bot):
             continue
-        norm = re.sub(r'\d+', '#', r.text.strip())
+        norm = _RE_DIGITS.sub('#', r.text.strip())
         if not norm:
             continue
         margin_texts.setdefault(norm, set()).add(r.page)
 
-    # Which normalized strings appear on enough pages?
-    repeated = set()
-    for norm, pages in margin_texts.items():
-        if len(pages) / total_pages >= 0.30:
-            repeated.add(norm)
+    threshold = total_pages * 0.30
+    repeated = {norm for norm, pages in margin_texts.items() if len(pages) >= threshold}
 
     if not repeated:
         return runs
@@ -345,7 +327,7 @@ def _remove_margin_runs(runs: list[FontRun], total_pages: int) -> list[FontRun]:
     filtered = []
     removed = 0
     for r in runs:
-        norm = re.sub(r'\d+', '#', r.text.strip())
+        norm = _RE_DIGITS.sub('#', r.text.strip())
         in_top = r.page_height > 0 and r.top < r.page_height * MARGIN_FRAC
         in_bot = r.page_height > 0 and r.top > r.page_height * (1 - MARGIN_FRAC)
         if (in_top or in_bot) and norm in repeated:
@@ -495,13 +477,13 @@ def _apply_pattern_roles(segments: list[Segment]) -> list[Segment]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 2b: FALLBACK — TEXT-ONLY SEGMENTATION (no font info)
+# STEP 2b: FALLBACK / TXT FILE — TEXT-ONLY SEGMENTATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def text_to_segments(text: str, page: int = 0) -> list[Segment]:
+def text_to_segments(text: str, page: int = 1) -> list[Segment]:
     """
-    When pdfplumber is unavailable or font extraction fails,
-    segment text purely by regex patterns.
+    When pdfplumber is unavailable, font extraction fails, OR when using a .txt file.
+    Segments text purely by regex patterns.
     """
     lines = text.split('\n')
     segments = []
@@ -557,17 +539,15 @@ def remove_repeated_segments(segments: list[Segment], total_pages: int) -> list[
     if total_pages < 4:
         return segments
 
-    text_page_counts = Counter()
+    # Count distinct pages each normalized text appears on
+    norm_pages: dict[str, set[int]] = {}
     for seg in segments:
-        normalized = re.sub(r'\d+', '#', seg.text.strip())
-        text_page_counts[(normalized, seg.page)] = 1
+        norm = _RE_DIGITS.sub('#', seg.text.strip())
+        if norm:
+            norm_pages.setdefault(norm, set()).add(seg.page)
 
-    # Count across pages (not occurrences)
-    text_counts = Counter()
-    for (norm_text, _), _ in text_page_counts.items():
-        text_counts[norm_text] += 1
-
-    repeated = {t for t, c in text_counts.items() if c / total_pages >= 0.4}
+    threshold = total_pages * 0.4
+    repeated = {norm for norm, pages in norm_pages.items() if len(pages) >= threshold}
 
     if not repeated:
         return segments
@@ -575,11 +555,10 @@ def remove_repeated_segments(segments: list[Segment], total_pages: int) -> list[
     filtered = []
     removed = 0
     for seg in segments:
-        normalized = re.sub(r'\d+', '#', seg.text.strip())
-        if normalized in repeated:
+        if _RE_DIGITS.sub('#', seg.text.strip()) in repeated:
             removed += 1
-            continue
-        filtered.append(seg)
+        else:
+            filtered.append(seg)
 
     if removed:
         print(f"  🧹 Removed {removed} repeated header/footer segments.")
@@ -611,74 +590,87 @@ UNITS = {
     r'(\d)\s*mph\b': r'\1 miles per hour',
 }
 
+# Pre-compiled substitutions for clean_segment_text (avoids re-compiling on every call)
+_ABBREV_COMPILED = [(re.compile(p), r) for p, r in ABBREVIATIONS.items()]
+_UNITS_COMPILED  = [(re.compile(p), r) for p, r in UNITS.items()]
+
+_RE_HYPHEN_BREAK  = re.compile(r'(\w)-\s*\n\s*(\w)')
+_RE_CID           = re.compile(r'\(cid:\d+\)')
+_RE_CITE_NUM      = re.compile(r'\s*\[\d+(?:[,\-–]\s*\d+)*\]')
+_RE_CITE_AUTH     = re.compile(r'\s*\([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and|&)\s+[A-Z][a-z]+)*,?\s*\d{4}[a-z]?\)')
+_RE_DAGGERS       = re.compile(r'[†‡§¶]')
+_RE_URL_HTTP      = re.compile(r'https?://\S+')
+_RE_URL_WWW       = re.compile(r'www\.\S+')
+_RE_PAGE_NUM      = re.compile(r'^\s*\d{1,4}\s*$', re.MULTILINE)
+_RE_AMPERSAND     = re.compile(r'\s*&\s*')
+_RE_AT            = re.compile(r'@')
+_RE_HASH_NUM      = re.compile(r'(?<!\w)#(\d+)')
+_RE_TILDE_NUM     = re.compile(r'~(\d)')
+_RE_GTE           = re.compile(r'≥')
+_RE_LTE           = re.compile(r'≤')
+_RE_ARROW         = re.compile(r'→')
+_RE_CURRENCY      = re.compile(r'([$£€₹])\s*(\d[\d,]*\.?\d*)\s*([KkMmBbTt])?(?=\s|$|[,.\)])')
+_RE_ISO_DATE      = re.compile(r'\b(\d{4})[-/](\d{2})[-/](\d{2})\b')
+_RE_EM_DASH       = re.compile(r'\s*[—–]\s*')
+_RE_SPACES        = re.compile(r'[ \t]+')
+_RE_NEWLINES      = re.compile(r'\n{2,}')
+
+_ORDINALS = {
+    '1st': 'first', '2nd': 'second', '3rd': 'third', '4th': 'fourth',
+    '5th': 'fifth', '10th': 'tenth', '20th': 'twentieth', '21st': 'twenty-first',
+}
+_ORDINALS_COMPILED = [(re.compile(rf'\b{num}\b'), word) for num, word in _ORDINALS.items()]
+
+_MONTHS = {
+    '01': 'January', '02': 'February', '03': 'March', '04': 'April',
+    '05': 'May', '06': 'June', '07': 'July', '08': 'August',
+    '09': 'September', '10': 'October', '11': 'November', '12': 'December',
+}
+_CURRENCY_MAP = {"$": "dollars", "£": "pounds", "€": "euros", "₹": "rupees"}
+_MULTIPLIER_MAP = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion"}
+
 
 def clean_segment_text(text: str) -> str:
     """Apply all local NLP cleanup to a segment's text."""
-    # Fix hyphenation
-    text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+    text = _RE_HYPHEN_BREAK.sub(r'\1\2', text)
+    text = _RE_CID.sub('', text)
+    text = _RE_CITE_NUM.sub('', text)
+    text = _RE_CITE_AUTH.sub('', text)
+    text = _RE_DAGGERS.sub('', text)
+    text = _RE_URL_HTTP.sub('', text)
+    text = _RE_URL_WWW.sub('', text)
+    text = _RE_PAGE_NUM.sub('', text)
 
-    # Remove PDF encoding artifacts (e.g. bullet glyphs rendered as (cid:127))
-    text = re.sub(r'\(cid:\d+\)', '', text)
+    for pat, rep in _ABBREV_COMPILED:
+        text = pat.sub(rep, text)
+    for pat, rep in _UNITS_COMPILED:
+        text = pat.sub(rep, text)
 
-    # Remove citations
-    text = re.sub(r'\s*\[\d+(?:[,\-–]\s*\d+)*\]', '', text)
-    text = re.sub(r'\s*\([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and|&)\s+[A-Z][a-z]+)*,?\s*\d{4}[a-z]?\)', '', text)
-    text = re.sub(r'[†‡§¶]', '', text)
+    text = _RE_AMPERSAND.sub(' and ', text)
+    text = _RE_AT.sub(' at ', text)
+    text = _RE_HASH_NUM.sub(r'number \1', text)
+    text = _RE_TILDE_NUM.sub(r'approximately \1', text)
+    text = _RE_GTE.sub('greater than or equal to ', text)
+    text = _RE_LTE.sub('less than or equal to ', text)
+    text = _RE_ARROW.sub('leads to ', text)
 
-    # Remove URLs
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'www\.\S+', '', text)
-
-    # Remove standalone page numbers
-    text = re.sub(r'^\s*\d{1,4}\s*$', '', text, flags=re.MULTILINE)
-
-    # Expand abbreviations
-    for pat, rep in ABBREVIATIONS.items():
-        text = re.sub(pat, rep, text)
-
-    # Expand units
-    for pat, rep in UNITS.items():
-        text = re.sub(pat, rep, text)
-
-    # Expand symbols
-    text = re.sub(r'\s*&\s*', ' and ', text)
-    text = re.sub(r'@', ' at ', text)
-    text = re.sub(r'(?<!\w)#(\d+)', r'number \1', text)
-    text = re.sub(r'~(\d)', r'approximately \1', text)
-    text = re.sub(r'≥', 'greater than or equal to ', text)
-    text = re.sub(r'≤', 'less than or equal to ', text)
-    text = re.sub(r'→', 'leads to ', text)
-
-    # Expand currencies
     def _money(m):
-        sym = m.group(1)
-        amt = m.group(2)
-        suf = (m.group(3) or "").upper()
-        cur = {"$": "dollars", "£": "pounds", "€": "euros", "₹": "rupees"}.get(sym, "dollars")
-        mul = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion"}.get(suf, "")
+        sym, amt, suf = m.group(1), m.group(2), (m.group(3) or "").upper()
+        cur = _CURRENCY_MAP.get(sym, "dollars")
+        mul = _MULTIPLIER_MAP.get(suf, "")
         return f"{amt} {mul} {cur}".strip() if mul else f"{amt} {cur}"
-    text = re.sub(r'([$£€₹])\s*(\d[\d,]*\.?\d*)\s*([KkMmBbTt])?(?=\s|$|[,.\)])', _money, text)
+    text = _RE_CURRENCY.sub(_money, text)
 
-    # Expand ordinals
-    ordinals = {'1st': 'first', '2nd': 'second', '3rd': 'third', '4th': 'fourth',
-                '5th': 'fifth', '10th': 'tenth', '20th': 'twentieth', '21st': 'twenty-first'}
-    for num, word in ordinals.items():
-        text = re.sub(rf'\b{num}\b', word, text)
+    for pat, word in _ORDINALS_COMPILED:
+        text = pat.sub(word, text)
 
-    # Expand dates
-    months = {'01':'January','02':'February','03':'March','04':'April','05':'May',
-              '06':'June','07':'July','08':'August','09':'September','10':'October',
-              '11':'November','12':'December'}
     def _iso(m):
-        return f"{months.get(m.group(2), m.group(2))} {int(m.group(3))}, {m.group(1)}"
-    text = re.sub(r'\b(\d{4})[-/](\d{2})[-/](\d{2})\b', _iso, text)
+        return f"{_MONTHS.get(m.group(2), m.group(2))} {int(m.group(3))}, {m.group(1)}"
+    text = _RE_ISO_DATE.sub(_iso, text)
 
-    # Em-dash → comma
-    text = re.sub(r'\s*[—–]\s*', ', ', text)
-
-    # Collapse whitespace
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n{2,}', ' ', text)
+    text = _RE_EM_DASH.sub(', ', text)
+    text = _RE_SPACES.sub(' ', text)
+    text = _RE_NEWLINES.sub(' ', text)
 
     return text.strip()
 
@@ -730,7 +722,7 @@ def ai_optimize_segments(segments: list[Segment], client, model: str) -> list[Se
     marked = segments_to_marked_text(segments)
 
     prompt = (
-        "Here is role-tagged PDF text. Each section starts with a role marker like [HEADER], [BODY], etc.\n"
+        "Here is role-tagged extracted text. Each section starts with a role marker like [HEADER], [BODY], etc.\n"
         "Optimize the text for TTS while preserving ALL role markers exactly as they are.\n"
         "Only clean/improve the text between markers.\n\n"
         f"{marked}"
@@ -779,30 +771,27 @@ async def stitch_segments_to_mp3(
     srt_entries = []
     time_offset_ms = 0
 
+    _RE_ALPHA_NUM = re.compile(r'[^a-zA-Z0-9]')
+
+    async def _render_one(idx: int, seg: Segment):
+        if seg.role == Role.PAUSE:
+            return None
+        if not _RE_ALPHA_NUM.sub('', seg.text):
+            return None
+        voice_cfg = profile.get(seg.role, profile[Role.BODY])
+        chunk_path = os.path.join(tmp_dir, f"{idx:05d}_segment.mp3")
+        try:
+            await generate_segment_audio(
+                seg.text, voice_cfg["voice"], voice_cfg["rate"], voice_cfg["volume"], chunk_path
+            )
+            return chunk_path
+        except Exception:
+            return None
+
     try:
-        for idx, seg in enumerate(segments):
-            if seg.role == Role.PAUSE:
-                continue
-
-            # Skip segments with no speakable text
-            speakable = re.sub(r'[^a-zA-Z0-9]', '', seg.text)
-            if not speakable:
-                continue
-
-            voice_cfg = profile.get(seg.role, profile[Role.BODY])
-            chunk_path = os.path.join(tmp_dir, f"{idx:05d}_segment.mp3")
-
-            # Generate this segment's audio — skip on failure, never crash the page
-            try:
-                await generate_segment_audio(
-                    seg.text, voice_cfg["voice"], voice_cfg["rate"], voice_cfg["volume"], chunk_path
-                )
-            except Exception:
-                continue
-
-            # Each edge-tts utterance already has ~300ms natural leading/trailing silence,
-            # so no separate pause file is needed — it would double the gap.
-            chunk_paths.append(chunk_path)
+        # Generate all segments concurrently
+        results = await asyncio.gather(*(_render_one(i, s) for i, s in enumerate(segments)))
+        chunk_paths = [p for p in results if p is not None]
 
         # Concatenate all MP3 chunks (MP3 is frame-based, binary concat works)
         with open(output_path, "wb") as out_f:
@@ -892,9 +881,15 @@ def cache_set(text: str, model: str, result: str, cache_dir: str) -> None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def run_pipeline(args):
-    pdf_path = args.pdf_path
-    if not os.path.isfile(pdf_path):
-        print(f"❌ File not found: {pdf_path}")
+    file_path = args.file_path
+    if not os.path.isfile(file_path):
+        print(f"❌ File not found: {file_path}")
+        return
+
+    # Check file extension
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in ['.pdf', '.txt']:
+        print(f"❌ Unsupported file type '{ext}'. Please provide a .pdf or .txt file.")
         return
 
     profile_name = args.profile
@@ -903,16 +898,18 @@ async def run_pipeline(args):
         return
     profile = VOICE_PROFILES[profile_name]
 
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pdf_dir = os.path.dirname(os.path.abspath(pdf_path))
-    output_folder = os.path.join(pdf_dir, f"{base_name}_audio_{timestamp}")
+    output_dir = os.path.dirname(os.path.abspath(file_path))
+    output_folder = os.path.join(output_dir, f"{base_name}_audio_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
     cache_dir = os.path.join(output_folder, CACHE_DIR) if not args.no_cache else None
 
     # --- Init Gemini ---
     client = None
     skip_ai = args.skip_ai
+
+    os.environ["GEMINI_API_KEY"] = "AIzaSyB5LPqyrbU3VLYTLeB9vFtUPzJ-j7b5Pe4"
     if not skip_ai:
         if genai is None:
             print("⚠️  google-genai not installed. Using local-only mode.")
@@ -926,38 +923,51 @@ async def run_pipeline(args):
 
     print(f"🎭 Voice profile: {profile_name}\n")
 
-    # ── STEP 1: Font-aware extraction ──
-    print(f"📄 Extracting with font analysis: {pdf_path}")
-    runs = extract_font_runs(pdf_path)
-
+    # ── STEP 1: Extraction ──
+    segments = []
     total_pages = 0
-    if pdfplumber:
-        with pdfplumber.open(pdf_path) as pdf:
-            total_pages = len(pdf.pages)
 
-    if runs:
-        print(f"   {len(runs)} font runs from {total_pages} pages.")
-        runs = _remove_margin_runs(runs, total_pages)
-        segments = font_runs_to_segments(runs)
-        print(f"   {len(segments)} role-tagged segments.")
-    else:
-        print("   Font extraction unavailable. Falling back to text-only segmentation.")
-        # Fallback: extract text and segment by patterns
+    if ext == '.txt':
+        print(f"📄 Reading plain text file: {file_path}")
+        print("   (Font analysis is disabled for .txt; detecting roles via text formatting)")
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw_text = f.read()
+        
+        if raw_text.strip():
+            segments = text_to_segments(raw_text, page=1)
+        total_pages = 1
+
+    elif ext == '.pdf':
+        print(f"📄 Extracting PDF with font analysis: {file_path}")
+        runs = extract_font_runs(file_path)
+
         if pdfplumber:
-            with pdfplumber.open(pdf_path) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    raw = page.extract_text(layout=True) or ""
-                    if raw.strip():
-                        segments = text_to_segments(raw, i + 1)
+            with pdfplumber.open(file_path) as pdf:
+                total_pages = len(pdf.pages)
+
+        if runs:
+            print(f"   {len(runs)} font runs from {total_pages} pages.")
+            runs = _remove_margin_runs(runs, total_pages)
+            segments = font_runs_to_segments(runs)
+            print(f"   {len(segments)} role-tagged segments.")
         else:
-            from pypdf import PdfReader
-            reader = PdfReader(pdf_path)
-            segments = []
-            for i, page in enumerate(reader.pages):
-                raw = page.extract_text() or ""
-                if raw.strip():
-                    segments.extend(text_to_segments(raw, i + 1))
-            total_pages = len(reader.pages)
+            print("   Font extraction unavailable. Falling back to text-only segmentation.")
+            # Fallback: extract text and segment by patterns
+            if pdfplumber:
+                with pdfplumber.open(file_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        raw = page.extract_text(layout=True) or ""
+                        if raw.strip():
+                            segments.extend(text_to_segments(raw, i + 1))
+            else:
+                from pypdf import PdfReader
+                reader = PdfReader(file_path)
+                for i, page in enumerate(reader.pages):
+                    raw = page.extract_text() or ""
+                    if raw.strip():
+                        segments.extend(text_to_segments(raw, i + 1))
+                total_pages = len(reader.pages)
 
     if not segments:
         print("❌ No text found.")
@@ -1005,7 +1015,10 @@ async def run_pipeline(args):
         print()
 
     # ── STEP 5: Generate multi-voice audio ──
-    if args.single_file:
+    # If it's a text file, force it to single-file output since pages don't exist.
+    is_single_file = args.single_file or ext == '.txt'
+
+    if is_single_file:
         mp3_path = os.path.join(output_folder, f"{base_name}_full.mp3")
         print(f"🔊 Generating multi-voice audio → {mp3_path}")
         print(f"   ({len(segments)} segments, stitching {len(set(profile[r]['voice'] for r in profile))} voices)...")
@@ -1016,7 +1029,7 @@ async def run_pipeline(args):
         except Exception as e:
             print(f"   ❌ Failed → {e}")
     else:
-        # Split into one audio file per page
+        # Split into one audio file per page (PDF only)
         pages: dict[int, list[Segment]] = {}
         for seg in segments:
             pages.setdefault(seg.page, []).append(seg)
@@ -1075,12 +1088,13 @@ def list_profiles():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PDF → Audio v3: Multi-voice, font-aware, role-based cinematic audio."
+        description="PDF & Text → Audio v3.1: Multi-voice, font-aware, role-based cinematic audio."
     )
-    parser.add_argument("pdf_path", nargs="?", default=None, help="Path to PDF.")
+    # Changed from pdf_path to file_path to reflect the new functionality
+    parser.add_argument("file_path", nargs="?", default=None, help="Path to PDF or TXT file.")
     parser.add_argument("--profile", default="default", help="Voice profile (default, audiobook, cinematic, indian, minimal).")
     parser.add_argument("--skip-ai", action="store_true", help="Local cleanup only.")
-    parser.add_argument("--single-file", action="store_true", help="One MP3 for whole PDF.")
+    parser.add_argument("--single-file", action="store_true", help="One MP3 for whole PDF (Default for TXT).")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Segments per Gemini call.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL}).")
     parser.add_argument("--srt", action="store_true", help="Generate SRT subtitles.")
@@ -1096,8 +1110,8 @@ def main():
     if args.list_profiles:
         list_profiles()
         return
-    if args.pdf_path is None:
-        parser.error("Provide a PDF path, or use --list-voices / --list-profiles.")
+    if args.file_path is None:
+        parser.error("Provide a file path (.pdf or .txt), or use --list-voices / --list-profiles.")
 
     asyncio.run(run_pipeline(args))
 
